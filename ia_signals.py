@@ -3,36 +3,34 @@ from __future__ import annotations
 import argparse
 import os
 import smtplib
-import urllib3
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from io import StringIO
 from typing import Optional, Dict, List, Tuple
 
+import certifi
 import pandas as pd
 import requests
+import urllib3
 import yfinance as yf
-import certifi
-
 
 # ==========================
 # SSL / CERTIFICATE SETUP
 # ==========================
 
-# Disable noisy warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Force Python / Requests / yfinance to use certifi certificates
 CA_BUNDLE = certifi.where()
 os.environ["SSL_CERT_FILE"] = CA_BUNDLE
 os.environ["REQUESTS_CA_BUNDLE"] = CA_BUNDLE
 os.environ["CURL_CA_BUNDLE"] = CA_BUNDLE
 
-
 # ==========================
 # CONFIGURATION
 # ==========================
 
+# Full universe of tickers to display and monitor
 TICKERS: List[str] = [
     "NVDA",
     "MSFT",
@@ -40,27 +38,53 @@ TICKERS: List[str] = [
     "META",
     "AMZN",
     "ASML",
+    "AMD",
+    "COST",
     "QQQ",
 ]
 
-PANIC_THRESHOLD = -0.08
-EUPHORIA_THRESHOLD = 0.10
-MISMATCH_TOLERANCE = 0.01
+# Core AI tickers used for allocation and IBKR suggestions
+CORE_AI_TICKERS = ["NVDA", "MSFT", "GOOGL", "META", "AMZN", "ASML", "AMD"]
+
+# Tickers shown only for information (no effect on allocation)
+INFO_ONLY_TICKERS = ["COST", "QQQ"]
+
+# 5-trading-day performance thresholds
+PANIC_THRESHOLD = -0.08    # -8% over last 5 sessions
+EUPHORIA_THRESHOLD = 0.10  # +10% over last 5 sessions
+
+# Data consistency tolerance between Yahoo and Twelve Data
+MISMATCH_TOLERANCE = 0.01  # 1 percentage point
+
+# Default monthly budget in USD for AI allocation
 DEFAULT_BUDGET = 4000.0
 
-STOOQ_OVERRIDE: Dict[str, str] = {
-    # "ASML": "ASML.US",
-    # "ASML.AS": "ASML.NL",
-    # "QQQ": "QQQ.US",
+# Signal weights for allocation
+WEIGHTS = {
+    "PANIC_BUY": 2.0,
+    "NORMAL": 1.0,
+    "EUPHORIA": 0.25,
 }
 
+# Reference monthly amounts in IBKR (used only for email suggestions)
+IBKR_REFERENCE_MONTHLY: Dict[str, float] = {
+    "NVDA": 1000.0,
+    "MSFT": 700.0,
+    "GOOGL": 700.0,
+    "META": 500.0,
+    "AMZN": 500.0,
+    "ASML": 300.0,
+    "COST": 100.0,
+    # "AMD": 0.0,  # define when you start a recurring amount for AMD
+    # "QQQ": 0.0,
+}
 
 # ==========================
 # DATA SOURCES
 # ==========================
 
 def download_yahoo_close(ticker: str, lookback_days: int = 10) -> Optional[pd.Series]:
-    """Robust Yahoo Finance download. Always returns Series or None."""
+    """Robust Yahoo Finance download. Returns Series or None."""
     try:
         hist = yf.download(
             ticker,
@@ -88,18 +112,14 @@ def download_yahoo_close(ticker: str, lookback_days: int = 10) -> Optional[pd.Se
 
     close = hist["Close"]
 
-    # NEW: handle both Series and DataFrame for Close
     if isinstance(close, pd.DataFrame):
-        # If MultiIndex columns (e.g. (field, ticker)), try to select the right one
+        # MultiIndex columns (field, ticker) or multiple columns
         if isinstance(close.columns, pd.MultiIndex):
-            # try to select column where second level == ticker
             try:
                 close = close.xs(ticker, axis=1, level=-1)
             except Exception:
-                # fallback: take first column
                 close = close.iloc[:, 0]
         else:
-            # Simple DataFrame: take the first column
             close = close.iloc[:, 0]
 
     if not isinstance(close, pd.Series):
@@ -114,9 +134,10 @@ def download_yahoo_close(ticker: str, lookback_days: int = 10) -> Optional[pd.Se
 
     return close
 
-def download_twelve_close(ticker: str, lookback_days: int = 10) -> Optional[pd.Series]:
-    api_key = os.getenv("TWELVE_API_KEY")
 
+def download_twelve_close(ticker: str, lookback_days: int = 10) -> Optional[pd.Series]:
+    """Download daily close prices from Twelve Data. Returns Series or None."""
+    api_key = os.getenv("TWELVE_API_KEY")
     if not api_key:
         print("[TwelveData] Missing API key (TWELVE_API_KEY).")
         return None
@@ -158,19 +179,19 @@ def download_twelve_close(ticker: str, lookback_days: int = 10) -> Optional[pd.S
 
     return series.tail(lookback_days + 2)
 
-
 # ==========================
-# 5 DAY CHANGE
+# 5-DAY PERFORMANCE
 # ==========================
 
 def compute_5d_change(series: pd.Series) -> float:
+    """Compute 5-trading-day change: (last / close_5_sessions_ago - 1)."""
     if not isinstance(series, pd.Series):
         raise TypeError(f"Input is not Series: {type(series)}")
 
     series = series.dropna()
 
     if len(series) < 6:
-        raise ValueError("Not enough data points")
+        raise ValueError("Not enough data points to compute 5-day change")
 
     last = float(series.iloc[-1])
     prev_5 = float(series.iloc[-6])
@@ -179,6 +200,7 @@ def compute_5d_change(series: pd.Series) -> float:
 
 
 def get_5d_change_robust(ticker: str) -> Tuple[Optional[float], str, Optional[float]]:
+    """Return a robust 5-day performance estimate using Yahoo + Twelve Data."""
     yahoo = download_yahoo_close(ticker)
     twelve = download_twelve_close(ticker)
 
@@ -217,9 +239,8 @@ def get_5d_change_robust(ticker: str) -> Tuple[Optional[float], str, Optional[fl
 
     return float(yahoo_change), "YAHOO", float(twelve_change)
 
-
 # ==========================
-# SIGNAL
+# SIGNAL CLASSIFICATION
 # ==========================
 
 def classify_signal(change_5d: float) -> str:
@@ -229,95 +250,266 @@ def classify_signal(change_5d: float) -> str:
         return "EUPHORIA"
     return "NORMAL"
 
-
 # ==========================
-# ALLOCATION
+# ALLOCATION LOGIC
 # ==========================
 
-WEIGHTS = {
-    "PANIC_BUY": 2.0,
-    "NORMAL": 1.0,
-    "EUPHORIA": 0.25,
-}
-
-
-def compute_allocation(signals: Dict[str, str], budget: float) -> Tuple[Dict[str, float], float]:
+def compute_allocation(
+    signals: Dict[str, str],
+    budget: float,
+) -> Tuple[Dict[str, float], float]:
     """
-    Weighted allocation based on signal strength.
+    Weighted allocation based on signal strength, only for core AI tickers.
 
-    PANIC_BUY  -> overweight
-    NORMAL     -> neutral
-    EUPHORIA   -> underweight (but never zero)
+    CORE_AI_TICKERS are used for allocation:
+        PANIC_BUY  -> overweight
+        NORMAL     -> neutral
+        EUPHORIA   -> underweight
+
+    INFO_ONLY_TICKERS are ignored for allocation.
     """
-
-    allocation: Dict[str, float] = {}
+    allocation: Dict[str, float] = {t: 0.0 for t in signals.keys()}
     weights: Dict[str, float] = {}
 
-    # assign weights
     for ticker, signal in signals.items():
-        weight = WEIGHTS.get(signal, 0)
+        if ticker not in CORE_AI_TICKERS:
+            continue
+        weight = WEIGHTS.get(signal, 0.0)
         if weight > 0:
             weights[ticker] = weight
 
     total_weight = sum(weights.values())
 
-    # edge case: nothing investable
     if total_weight == 0:
-        return {t: 0.0 for t in signals}, budget
+        return allocation, budget
 
-    # normalized allocation
     for ticker, weight in weights.items():
         allocation[ticker] = round(budget * weight / total_weight, 2)
 
     cash_remainder = round(budget - sum(allocation.values()), 2)
 
-    # minor rounding adjustment
-    if cash_remainder != 0:
-        first = next(iter(allocation))
-        allocation[first] += cash_remainder
+    if abs(cash_remainder) >= 0.01:
+        first = next(iter(weights.keys()))
+        allocation[first] = round(allocation[first] + cash_remainder, 2)
         cash_remainder = 0.0
-
-    # ensure all tickers exist in output
-    for t in signals:
-        allocation.setdefault(t, 0.0)
 
     return allocation, cash_remainder
 
-
 # ==========================
-# EMAIL
+# EMAIL CONTENT (TEXT + HTML)
 # ==========================
 
-def build_report_text(results, allocation, cash, had_error) -> str:
-    lines = [f"AI Robust Signals {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"]
+def build_email_content(
+    results: Dict[str, dict],
+    allocation: Dict[str, float],
+    cash_remainder: float,
+    had_error: bool,
+) -> Tuple[str, str]:
+    """
+    Build plain-text and HTML email bodies.
 
-    for t, info in results.items():
-        if info["change_5d"] is None:
-            lines.append(f"{t:8s} | NO DATA")
-            continue
+    Sections:
+    - Summary
+    - 5-day performance and signals (all tickers, sorted by 5d change)
+    - Recommended allocation for AI leaders
+    - IBKR adjustments for this month
+    """
 
-        pct = f"{info['change_5d']*100:.2f}%"
-        extra = f" (Stooq {info['secondary_change_5d']*100:.2f}%)" if info["source"] == "MISMATCH" else ""
-        lines.append(f"{t:8s} | 5d {pct:>8} | {info['signal']} | {info['source']}{extra}")
+    # Summary
+    signals_list = [info.get("signal") for info in results.values() if info.get("signal")]
+    has_panic = any(s == "PANIC_BUY" for s in signals_list)
+    has_euphoria = any(s == "EUPHORIA" for s in signals_list)
 
-    lines.append("\nAllocation suggestion:")
-
-    for t, amt in allocation.items():
-        if amt > 0:
-            lines.append(f"  {t:8s} -> {amt:.2f} USD")
-
-    if cash > 0:
-        lines.append(f"  Cash remainder: {cash:.2f} USD")
+    if has_panic and has_euphoria:
+        summary_text = "Some tickers are in PANIC and some are in EUPHORIA. Rebalancing is recommended."
+    elif has_panic:
+        summary_text = "Some tickers are in PANIC. Additional investment is recommended."
+    elif has_euphoria:
+        summary_text = "Some tickers are in EUPHORIA. Reduced exposure is recommended."
+    else:
+        summary_text = "All signals are normal. No action required this month."
 
     if had_error:
-        lines.append("\n⚠ WARNING: Data errors occurred.")
+        summary_text += " Data errors occurred for some tickers. Please review values carefully."
 
-    return "\n".join(lines)
+    summary_html = summary_text
+    summary_html = summary_html.replace(
+        "PANIC",
+        '<span style="font-weight:bold; color:#c0392b;">PANIC</span>'
+    )
+    summary_html = summary_html.replace(
+        "EUPHORIA",
+        '<span style="font-weight:bold; color:#e67e22;">EUPHORIA</span>'
+    )
+
+    # 5-day performance table (sorted)
+    rows = []
+    for ticker, info in results.items():
+        change = info.get("change_5d")
+        signal = info.get("signal")
+        rows.append((ticker, change, signal))
+
+    def sort_key(row):
+        ticker, change, signal = row
+        if change is None:
+            return float("-inf")
+        return change
+
+    rows_sorted = sorted(rows, key=sort_key, reverse=True)
+
+    text_lines: List[str] = []
+    text_lines.append(summary_text)
+    text_lines.append("")
+    text_lines.append("5-day performance and signals (sorted by 5d change):")
+    text_lines.append("Ticker | 5d Change | Signal")
+
+    for ticker, change, signal in rows_sorted:
+        if change is None:
+            change_str = "n/a"
+        else:
+            change_str = f"{change * 100: .2f}%"
+        text_lines.append(f"{ticker:6s} | {change_str:>8s} | {signal or 'n/a'}")
+
+    html_rows = []
+    for ticker, change, signal in rows_sorted:
+        if change is None:
+            change_str = "n/a"
+        else:
+            change_str = f"{change * 100: .2f}%"
+
+        if signal == "PANIC_BUY":
+            signal_label = "PANIC"
+            color = "#c0392b"
+        elif signal == "EUPHORIA":
+            signal_label = "EUPHORIA"
+            color = "#e67e22"
+        elif signal == "NORMAL":
+            signal_label = "NORMAL"
+            color = "#2c3e50"
+        else:
+            signal_label = signal or "n/a"
+            color = "#7f8c8d"
+
+        # ✅ version sans bug de guillemets
+        signal_html = f"<span style='font-weight:bold; color:{color};'>{signal_label}</span>"
+
+        html_rows.append(
+            "<tr>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd;'>{ticker}</td>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>{change_str}</td>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd;'>{signal_html}</td>"
+            "</tr>"
+        )
 
 
-def send_email(subject: str, body: str) -> None:
+    html_table = (
+        "<table style='border-collapse:collapse; font-family:Arial, sans-serif; font-size:13px;'>"
+        "<thead>"
+        "<tr>"
+        "<th style='padding:4px 8px; border:1px solid #ddd; text-align:left;'>Ticker</th>"
+        "<th style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>5d Change</th>"
+        "<th style='padding:4px 8px; border:1px solid #ddd; text-align:left;'>Signal</th>"
+        "</tr>"
+        "</thead>"
+        "<tbody>"
+        + "".join(html_rows) +
+        "</tbody>"
+        "</table>"
+    )
+
+    # Allocation for core AI leaders
+    core_alloc_items = [
+        (t, allocation.get(t, 0.0))
+        for t in CORE_AI_TICKERS
+        if allocation.get(t, 0.0) > 0
+    ]
+    total_core_alloc = sum(a for _, a in core_alloc_items)
+
+    text_lines.append("")
+    text_lines.append(
+        f"Recommended monthly allocation for AI leaders ({total_core_alloc:.0f} USD):"
+    )
+    for ticker, amount in core_alloc_items:
+        text_lines.append(f"{ticker:6s} {amount:.2f}")
+
+    html_alloc_rows = []
+    for ticker, amount in core_alloc_items:
+        html_alloc_rows.append(
+            "<tr>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd;'>{ticker}</td>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>{amount:.2f}</td>"
+            "</tr>"
+        )
+
+    html_alloc_table = (
+        "<table style='border-collapse:collapse; font-family:Arial, sans-serif; font-size:13px; margin-top:8px;'>"
+        "<thead>"
+        "<tr>"
+        "<th style='padding:4px 8px; border:1px solid #ddd; text-align:left;'>Ticker</th>"
+        "<th style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>Monthly amount (USD)</th>"
+        "</tr>"
+        "</thead>"
+        "<tbody>"
+        + "".join(html_alloc_rows) +
+        "</tbody>"
+        "</table>"
+    )
+
+    # IBKR adjustments
+    text_lines.append("")
+    text_lines.append("IBKR adjustments for this month:")
+
+    ibkr_lines: List[str] = []
+    ibkr_html_rows: List[str] = []
+
+    for ticker, amount in core_alloc_items:
+        old = IBKR_REFERENCE_MONTHLY.get(ticker)
+        if old is None:
+            continue
+        if abs(old - amount) < 1.0:
+            continue
+        ibkr_lines.append(
+            f"{ticker}:\n"
+            f"Change monthly investment from {old:.0f} to {amount:.0f}\n"
+        )
+        ibkr_html_rows.append(
+            "<p style='margin:4px 0;'>"
+            f"<strong>{ticker}:</strong><br>"
+            f"Change monthly investment from {old:.0f} to {amount:.0f}"
+            "</p>"
+        )
+
+    if not ibkr_lines:
+        text_lines.append("No changes required. Keep your current automatic investments.")
+        ibkr_html_block = "<p>No changes required. Keep your current automatic investments.</p>"
+    else:
+        text_lines.extend(ibkr_lines)
+        ibkr_html_block = "".join(ibkr_html_rows)
+
+    text_body = "\n".join(text_lines)
+
+    html_body = f"""\
+<html>
+  <body style="font-family: Arial, sans-serif; font-size: 13px; color: #2c3e50;">
+    <p>{summary_html}</p>
+    <h3 style="margin-top:16px;">5-day performance and signals</h3>
+    {html_table}
+    <h3 style="margin-top:16px;">Recommended monthly allocation for AI leaders</h3>
+    {html_alloc_table}
+    <h3 style="margin-top:16px;">IBKR adjustments for this month</h3>
+    {ibkr_html_block}
+  </body>
+</html>
+"""
+    return text_body, html_body
+
+# ==========================
+# EMAIL SEND
+# ==========================
+
+def send_email(subject: str, text_body: str, html_body: str) -> None:
     """
-    Send an email using SMTP settings from environment variables.
+    Send a multipart email (plain text + HTML) using SMTP settings from environment variables.
 
     Required environment variables:
         SMTP_HOST
@@ -328,23 +520,12 @@ def send_email(subject: str, body: str) -> None:
 
     Optional:
         EMAIL_TO (if missing -> defaults to SMTP_USER)
-
-    Typical example (Gmail):
-        SMTP_HOST = smtp.gmail.com
-        SMTP_PORT = 587
-        SMTP_USER = your@gmail.com
-        SMTP_PASSWORD = app_password
-        EMAIL_FROM = your@gmail.com
-        EMAIL_TO = receiver@gmail.com   (optional)
     """
-
     host = os.getenv("SMTP_HOST")
     port = os.getenv("SMTP_PORT")
     user = os.getenv("SMTP_USER")
     password = os.getenv("SMTP_PASSWORD")
     email_from = os.getenv("EMAIL_FROM")
-
-    # If EMAIL_TO is not defined, use SMTP_USER as destination (safe fallback)
     email_to = os.getenv("EMAIL_TO") or user
 
     if not all([host, port, user, password, email_from, email_to]):
@@ -352,97 +533,192 @@ def send_email(subject: str, body: str) -> None:
         print(f"host={host}, port={port}, user={user}, from={email_from}, to={email_to}")
         return
 
-    msg = MIMEText(body, "plain", "utf-8")
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = email_from
     msg["To"] = email_to
+
+    part_text = MIMEText(text_body, "plain", "utf-8")
+    part_html = MIMEText(html_body, "html", "utf-8")
+
+    msg.attach(part_text)
+    msg.attach(part_html)
 
     try:
         with smtplib.SMTP(host, int(port), timeout=20) as server:
             server.starttls()
             server.login(user, password)
             server.send_message(msg)
-
         print(f"[Email] Report sent successfully to {email_to}")
-
     except Exception as e:
         print(f"[Email] ERROR while sending email: {e}")
 
-
-
 # ==========================
-# MAIN
+# EMAIL MODE DECISION
 # ==========================
 
-def run_signals(budget: float, email_mode: str, dry: bool = False) -> int:
+def should_send_email(
+    results: Dict[str, dict],
+    had_error: bool,
+    mode: str,
+) -> bool:
+    """
+    Decide whether an email should be sent based on mode and signals.
+
+    mode:
+        - "always"
+        - "only_on_action" (default)
+        - "never"
+    """
+    mode = (mode or "only_on_action").lower().strip()
+
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+
+    if had_error:
+        return True
+
+    for info in results.values():
+        signal = info.get("signal")
+        source = info.get("source")
+        change_5d = info.get("change_5d")
+
+        if signal in ("PANIC_BUY", "EUPHORIA"):
+            return True
+        if source in ("MISMATCH", "NONE"):
+            return True
+        if change_5d is None:
+            return True
+
+    return False
+
+# ==========================
+# MAIN EXECUTION
+# ==========================
+
+def run_signals(budget: float, email_mode: str, dry_run: bool = False) -> int:
     print(f"=== AI Robust Signals {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} ===\n")
-    results = {}
-    signals = {}
+
+    results: Dict[str, dict] = {}
+    signals: Dict[str, str] = {}
     had_error = False
 
-    for t in TICKERS:
+    for ticker in TICKERS:
         try:
-            change, src, other = get_5d_change_robust(t)
+            change_5d, source, sec_change = get_5d_change_robust(ticker)
         except Exception as e:
-            print(f"[ERROR] {t}: {e}")
             had_error = True
-            results[t] = {"change_5d": None, "signal": "ERROR", "source": "ERROR", "secondary_change_5d": None}
+            print(f"[ERROR] Unexpected error while processing {ticker}: {e}")
+            results[ticker] = {
+                "change_5d": None,
+                "source": "ERROR",
+                "secondary_change_5d": None,
+                "signal": "ERROR",
+            }
             continue
 
-        if change is None:
-            results[t] = {"change_5d": None, "signal": "NO_DATA", "source": src, "secondary_change_5d": None}
-            print(f"{t:8s} | NO DATA")
+        if change_5d is None:
+            print(f"{ticker:8s} | NO DATA")
+            results[ticker] = {
+                "change_5d": None,
+                "source": source,
+                "secondary_change_5d": sec_change,
+                "signal": "NO_DATA",
+            }
             continue
 
-        change = float(change)
-        signal = classify_signal(change)
-        signals[t] = signal
+        signal = classify_signal(change_5d)
+        signals[ticker] = signal
 
-        results[t] = {
-            "change_5d": change,
+        pct_str = f"{change_5d * 100: .2f}%"
+        extra = ""
+        if source == "MISMATCH" and sec_change is not None:
+            extra = f" (TwelveData: {sec_change*100: .2f}%)"
+
+        print(
+            f"{ticker:8s} | 5d: {pct_str:>8} | "
+            f"Source: {source:9s} | Signal: {signal}{extra}"
+        )
+
+        results[ticker] = {
+            "change_5d": change_5d,
+            "source": source,
+            "secondary_change_5d": sec_change,
             "signal": signal,
-            "source": src,
-            "secondary_change_5d": other,
         }
 
-        line = f"{t:8s} | {change*100:>7.2f}% | {signal} | {src}"
-        if src == "MISMATCH":
-            line += f" (Stooq {other*100:.2f}%)"
-        print(line)
+    print("\n--- Allocation suggestion (core AI only) ---")
+    allocation, cash_remainder = compute_allocation(signals, budget)
 
-    allocation, cash = compute_allocation(signals, budget)
+    core_alloc_items = [
+        (t, allocation.get(t, 0.0))
+        for t in CORE_AI_TICKERS
+        if allocation.get(t, 0.0) > 0
+    ]
 
-    print("\n--- ALLOCATION ---")
-    for t, amt in allocation.items():
-        if amt > 0:
-            print(f"{t:8s} -> {amt:.2f} USD")
-    if cash > 0:
-        print(f"Cash   -> {cash:.2f} USD")
-
-    report = build_report_text(results, allocation, cash, had_error)
-    mode = os.getenv("EMAIL_MODE", email_mode)
-
-    if mode == "always" or (mode == "only_on_action" and any(s in ["PANIC_BUY", "EUPHORIA"] for s in signals.values())):
-        if dry:
-            print("\n[DRY-RUN] Email not sent.")
-        else:
-            print("\n[INFO] Sending email...")
-            send_email("AI Signals Report", report)
+    if not core_alloc_items:
+        print(f"No valid allocation for core AI tickers. Keep {budget:.2f} USD as cash.")
     else:
-        print("\n[INFO] No email sent.")
+        for t, amount in core_alloc_items:
+            print(f"{t:8s} -> {amount:8.2f} USD")
+        if cash_remainder > 0:
+            print(f"Cash remainder: {cash_remainder:.2f} USD")
+
+    # Email content
+    text_body, html_body = build_email_content(results, allocation, cash_remainder, had_error)
+    email_mode_env = os.getenv("EMAIL_MODE", email_mode or "only_on_action")
+
+    if should_send_email(results, had_error, email_mode_env):
+        subject = "AI Signals Report"
+        if dry_run:
+            print("\n[DRY-RUN] Email would be sent with subject:", subject)
+        else:
+            print("\n[INFO] Sending email report...")
+            send_email(subject, text_body, html_body)
+    else:
+        print("\n[INFO] No email sent (mode =", email_mode_env, ")")
 
     return 1 if had_error else 0
 
+# ==========================
+# CLI
+# ==========================
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--budget", type=float, default=DEFAULT_BUDGET)
-    ap.add_argument("--email-mode", choices=["always", "only_on_action", "never"], default="only_on_action")
-    ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="AI signals and allocation helper (Yahoo + TwelveData, GitHub Actions friendly)"
+    )
+    parser.add_argument(
+        "--budget",
+        type=float,
+        default=DEFAULT_BUDGET,
+        help=f"Monthly budget in USD (default: {DEFAULT_BUDGET})",
+    )
+    parser.add_argument(
+        "--email-mode",
+        type=str,
+        default="only_on_action",
+        choices=["only_on_action", "always", "never"],
+        help="Email mode: only_on_action (default), always, or never. "
+             "This can also be controlled via EMAIL_MODE env var.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do everything except actually sending emails.",
+    )
+    return parser.parse_args()
 
-    exit(run_signals(args.budget, args.email_mode, args.dry_run))
-
+def main() -> None:
+    args = parse_args()
+    exit_code = run_signals(
+        budget=args.budget,
+        email_mode=args.email_mode,
+        dry_run=args.dry_run,
+    )
+    raise SystemExit(exit_code)
 
 if __name__ == "__main__":
     main()

@@ -115,7 +115,7 @@ export EMAIL_FROM="bot@example.com"
 export EMAIL_TO="you@example.com"
 export EMAIL_MODE="only_on_action"
 
-python ia_signals.py --budget 4000
+py ia_signals.py --budget 4000
 ```
 
 Or force an email every time:
@@ -140,7 +140,7 @@ sending any email.
 1. Create a virtual environment (optional but recommended):
 
    ```bash
-   python -m venv .venv
+   py -m venv .venv
    source .venv/bin/activate  # on Windows: .venv\\Scripts\\activate
    ```
 
@@ -154,7 +154,7 @@ sending any email.
 3. Run the script:
 
    ```bash
-   python ia_signals.py --budget 4000
+   py ia_signals.py --budget 4000
    ```
 
    You should see something like:

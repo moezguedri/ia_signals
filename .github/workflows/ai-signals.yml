@@ -1,0 +1,41 @@
+name: AI Signals Daily
+
+env:
+  TWELVE_API_KEY: ${{ secrets.TWELVE_API_KEY }}
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Runs at 18:00 UTC Monday to Friday
+    - cron: "0 18 * * 1-5"
+
+jobs:
+  ai-signals:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run AI signals script
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          # Optional: override email mode here (only_on_action, always, never)
+          EMAIL_MODE: ${{ secrets.EMAIL_MODE }}
+        run: |
+          python ia_signals.py --budget 4000 --email-mode always

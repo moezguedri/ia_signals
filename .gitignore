@@ -1,0 +1,55 @@
+# Environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Python build
+build/
+dist/
+.eggs/
+*.egg-info/
+wheels/
+pip-wheel-metadata/
+
+# Virtualenv metadata
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+
+# Logs & databases
+*.log
+*.sqlite3
+
+# Jupyter
+.ipynb_checkpoints
+
+# IDE / Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# dotenv files
+.env
+.env.*

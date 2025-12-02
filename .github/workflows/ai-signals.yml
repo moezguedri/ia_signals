@@ -38,4 +38,4 @@ jobs:
           # Optional: override email mode here (only_on_action, always, never)
           EMAIL_MODE: ${{ secrets.EMAIL_MODE }}
         run: |
-          python ia_signals.py --budget 4000 --email-mode always
+          python ia_signals.py --budget 4000

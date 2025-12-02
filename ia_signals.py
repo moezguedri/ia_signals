@@ -37,15 +37,15 @@ TICKERS: List[str] = [
     "META",
     "AMZN",
     "ASML",
-    "AMD",
-    "CCJ",
-    "ETN",
-    "VRT",
+    # "AMD",
+    # "CCJ",
+    # "ETN",
+    # "VRT",
     "COST",
-    "QQQ",
+    # "QQQ",
 ]
 
-# Core AI tickers used for allocation and IBKR suggestions
+# Core AI tickers used for allocation (internal)
 CORE_AI_TICKERS = ["NVDA", "MSFT", "GOOGL", "META", "AMZN", "ASML", "AMD"]
 
 # Tickers shown only for information (no effect on allocation)
@@ -77,8 +77,19 @@ IBKR_REFERENCE_MONTHLY: Dict[str, float] = {
     "AMZN": 500.0,
     "ASML": 300.0,
     "COST": 100.0,
-    # "AMD": 0.0,  # define when you start a recurring amount for AMD
+    # "AMD": 0.0,
     # "QQQ": 0.0,
+}
+
+# Target long-term portfolio allocation (in % of total portfolio)
+PORTFOLIO_TARGETS: Dict[str, int] = {
+    "NVDA": 25,
+    "MSFT": 23,
+    "GOOGL": 13,
+    "META": 11,
+    "AMZN": 11,
+    "ASML": 12,
+    "COST": 5,
 }
 
 # ==========================
@@ -249,12 +260,239 @@ def get_returns_robust(ticker: str) -> Tuple[Optional[Dict[str, float]], str, Op
     return yahoo_ret, "YAHOO", twelve_ret
 
 # ==========================
-# SIGNAL CLASSIFICATION
+# PRICE, TARGET, ATH
+# ==========================
+
+def get_price_and_target(ticker: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Fetch last price and analyst target from Yahoo (via yfinance).
+    Returns (price, target, delta_pct) where delta_pct = (price/target - 1)*100.
+    """
+    price = None
+    target = None
+    delta_pct = None
+
+    try:
+        tk = yf.Ticker(ticker)
+
+        # Price
+        try:
+            fast = getattr(tk, "fast_info", None)
+            if fast:
+                if "lastPrice" in fast:
+                    price = float(fast["lastPrice"])
+                elif "last_price" in fast:
+                    price = float(fast["last_price"])
+        except Exception:
+            pass
+
+        if price is None:
+            hist = tk.history(period="1d", auto_adjust=True)
+            if isinstance(hist, pd.DataFrame) and not hist.empty and "Close" in hist.columns:
+                price = float(hist["Close"].iloc[-1])
+
+        # Analyst target
+        info = {}
+        try:
+            info = tk.info
+        except Exception as e:
+            print(f"[Yahoo] INFO fetch failed for {ticker}: {e}")
+
+        if info:
+            t = info.get("targetMeanPrice") or info.get("targetMedianPrice")
+            if t is not None:
+                target = float(t)
+
+        if price is not None and target is not None and target != 0:
+            delta_pct = (price / target - 1.0) * 100.0
+
+    except Exception as e:
+        print(f"[Yahoo] ERROR price/target for {ticker}: {e}")
+        return None, None, None
+
+    return price, target, delta_pct
+
+
+def is_near_ath(ticker: str, tolerance: float = 0.03) -> Optional[bool]:
+    """
+    Check if current price is within 'tolerance' of 5-year high.
+    Returns True/False/None if data unavailable.
+    """
+    try:
+        hist = yf.download(
+            ticker,
+            period="5y",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+    except Exception as e:
+        print(f"[Yahoo] ERROR ATH download for {ticker}: {e}")
+        return None
+
+    if not isinstance(hist, pd.DataFrame) or hist.empty or "Close" not in hist.columns:
+        return None
+
+    close = hist["Close"].dropna()
+    if close.empty:
+        return None
+
+    last = float(close.iloc[-1])
+    max_close = float(close.max())
+    if max_close <= 0:
+        return None
+
+    return last >= max_close * (1.0 - tolerance)
+
+# ==========================
+# MOMENTUM SCORE & TREND ANALYSIS
+# ==========================
+
+def compute_momentum_score(r10: float, r30: float, r90: float) -> float:
+    """
+    Weighted momentum score in percentage.
+    More weight on recent performance (10d, 30d).
+    """
+    return (0.5 * r10 + 0.3 * r30 + 0.2 * r90) * 100.0
+
+
+def bg_color_for_score(score: Optional[float]) -> str:
+    """
+    HTML background color based on momentum score.
+    """
+    if score is None:
+        return "#ffffff"
+
+    if score <= -15.0:
+        return "#f8d7da"  # strong red
+    if score <= -5.0:
+        return "#fdecea"  # light red
+    if score < 5.0:
+        return "#f8f9fa"  # very light grey
+    if score < 15.0:
+        return "#e8f8f5"  # light green
+    return "#d4efdf"      # stronger green
+
+
+def classify_trend(r10: Optional[float], r30: Optional[float], r90: Optional[float]) -> str:
+    """
+    Rough classification of 10d/30d/90d structure.
+    """
+    if None in (r10, r30, r90):
+        return "unknown"
+
+    if r10 > 0 and r30 > 0 and r90 > 0:
+        return "uptrend"
+    if r10 < 0 and r30 < 0 and r90 < 0:
+        return "downtrend"
+    if r10 < 0 and r30 < 0 and r90 > 0:
+        return "pullback_after_run"
+    if r10 < 0 and r30 > 0 and r90 > 0:
+        return "dip"
+    if r10 > 0 and r30 < 0 and r90 < 0:
+        return "bounce_in_downtrend"
+    return "sideways"
+
+
+def compute_dca_decision(
+    ticker: str,
+    r10: Optional[float],
+    r30: Optional[float],
+    r90: Optional[float],
+    is_core_target: bool,
+    near_ath_flag: Optional[bool],
+    price_target_delta_pct: Optional[float],
+) -> Tuple[str, float, Optional[float]]:
+    """
+    Compute final DCA action and factor for a given ticker,
+    combining:
+      - trend structure (10d/30d/90d)
+      - momentum score
+      - near ATH
+      - price vs analyst target
+      - core / non-core status
+    Returns (action_label, dca_factor, momentum_score).
+    """
+
+    trend = classify_trend(r10, r30, r90)
+
+    if None not in (r10, r30, r90):
+        score = compute_momentum_score(r10, r30, r90)
+    else:
+        score = None
+
+    # --- Base decision from trend ---
+    if trend in ("uptrend", "dip", "pullback_after_run"):
+        action = "ACCELERATE"
+        factor = 1.15
+    elif trend == "downtrend":
+        action = "SLOW DOWN"
+        factor = 0.85
+    else:  # sideways / unknown / bounce_in_downtrend
+        action = "MAINTAIN"
+        factor = 1.00
+
+    # --- Adjust with momentum intensity ---
+    if score is not None:
+        if score >= 20 and trend in ("uptrend", "dip", "pullback_after_run"):
+            action = "ACCELERATE STRONGLY"
+            factor = 1.30
+        elif score <= -20 and trend == "downtrend":
+            action = "SLOW DOWN"
+            factor = 0.80
+
+    # --- ATH adjustment (never 'strongly' on an ATH) ---
+    if near_ath_flag:
+        if action == "ACCELERATE STRONGLY":
+            action = "ACCELERATE"
+            factor = 1.15
+
+    # --- Price vs analyst target adjustment ---
+    if price_target_delta_pct is not None:
+        if price_target_delta_pct > 15.0:
+            # price well above target -> more prudence
+            if action == "ACCELERATE STRONGLY":
+                action = "ACCELERATE"
+                factor = 1.15
+            elif action == "ACCELERATE":
+                action = "MAINTAIN"
+                factor = 1.00
+        elif price_target_delta_pct < -15.0 and trend != "downtrend":
+            # price well below target in non-downtrend -> plus agressif
+            if action == "MAINTAIN":
+                action = "ACCELERATE"
+                factor = 1.15
+            elif action == "ACCELERATE":
+                action = "ACCELERATE STRONGLY"
+                factor = 1.30
+
+    # --- Core portfolio protection (never slow down trop fort) ---
+    if is_core_target:
+        if action == "SLOW DOWN":
+            action = "MAINTAIN"
+            factor = max(factor, 0.90)
+
+    # Normalize factor by action (pour éviter incohérences)
+    if action == "ACCELERATE STRONGLY":
+        factor = 1.30
+    elif action == "ACCELERATE":
+        factor = 1.15
+    elif action == "MAINTAIN":
+        factor = max(1.00, factor) if is_core_target else 1.00
+    elif action == "SLOW DOWN":
+        factor = 0.85
+
+    return action, factor, score
+
+# ==========================
+# SIGNAL CLASSIFICATION (internal)
 # ==========================
 
 def classify_signal(returns: Dict[str, float]) -> str:
     """
     Classify ticker based on average of 10d, 30d, 90d returns.
+    Used internally for allocation / email trigger, not displayed.
     """
     avg = (returns["R10"] + returns["R30"] + returns["R90"]) / 3.0
     if avg <= PANIC_THRESHOLD:
@@ -264,7 +502,7 @@ def classify_signal(returns: Dict[str, float]) -> str:
     return "NORMAL"
 
 # ==========================
-# ALLOCATION LOGIC
+# ALLOCATION LOGIC (internal)
 # ==========================
 
 def compute_allocation(
@@ -321,39 +559,46 @@ def build_email_content(
 
     Sections:
     - Summary
-    - Multi-horizon performance and signals (sorted by average return)
-    - Recommended allocation for AI leaders
-    - IBKR adjustments for this month
+    - Multi-horizon performance (10d / 30d / 90d / Momentum)
+    - DCA pacing recommendation (action finale + facteur)
+    - Explanation block
+    - Market vs analyst target
+    - Target portfolio allocation
     """
 
-    # Summary
+    # --------- Summary ---------
     signals_list = [info.get("signal") for info in results.values() if info.get("signal")]
     has_panic = any(s == "PANIC_BUY" for s in signals_list)
     has_euphoria = any(s == "EUPHORIA" for s in signals_list)
 
     if has_panic and has_euphoria:
-        summary_text = "Some tickers are in PANIC and some are in EUPHORIA. Rebalancing is recommended."
+        summary_text = (
+            "Strong divergences detected: some tickers show strong downside moves, "
+            "while others show strong upside moves across recent horizons. "
+            "Rebalancing may be appropriate."
+        )
     elif has_panic:
-        summary_text = "Some tickers are in PANIC. Additional investment is recommended."
+        summary_text = (
+            "Some tickers show strong downside moves over recent horizons. "
+            "This may represent opportunities to buy the dip gradually."
+        )
     elif has_euphoria:
-        summary_text = "Some tickers are in EUPHORIA. Reduced exposure is recommended."
+        summary_text = (
+            "Some tickers show strong upside moves over recent horizons. "
+            "Consider moderating the pace of new contributions on the hottest names."
+        )
     else:
-        summary_text = "All signals are normal. No action required this month."
+        summary_text = (
+            "No extreme moves detected across 10/30/90-day horizons. "
+            "The portfolio looks relatively balanced from a momentum perspective."
+        )
 
     if had_error:
         summary_text += " Data errors occurred for some tickers. Please review values carefully."
 
     summary_html = summary_text
-    summary_html = summary_html.replace(
-        "PANIC",
-        '<span style="font-weight:bold; color:#c0392b;">PANIC</span>'
-    )
-    summary_html = summary_html.replace(
-        "EUPHORIA",
-        '<span style="font-weight:bold; color:#e67e22;">EUPHORIA</span>'
-    )
 
-    # Multi-horizon table
+    # --------- Build rows with returns & helper data ---------
     rows = []
     for ticker, info in results.items():
         rets = info.get("returns")
@@ -368,6 +613,7 @@ def build_email_content(
         else:
             r10 = r30 = r90 = None
             avg = None
+
         rows.append((ticker, r10, r30, r90, info.get("signal"), avg))
 
     def sort_key(row):
@@ -381,43 +627,68 @@ def build_email_content(
     def fmt(p: Optional[float]) -> str:
         return "n/a" if p is None else f"{p*100: .2f}%"
 
+    # --------- Text version ---------
     text_lines: List[str] = []
     text_lines.append(summary_text)
     text_lines.append("")
-    text_lines.append("Multi-horizon performance and signals (sorted by average return):")
-    text_lines.append("Ticker | 10d | 30d | 90d | Signal")
+    text_lines.append("Multi-horizon performance (sorted by average 10d/30d/90d return):")
+    text_lines.append("Ticker |      10d |      30d |      90d | Momentum | DCA action | Factor")
+
+    dca_info_for_table: List[Tuple[str, Optional[float], str, float]] = []
 
     for ticker, r10, r30, r90, signal, avg in rows_sorted:
-        text_lines.append(
-            f"{ticker:6s} | {fmt(r10):>8s} | {fmt(r30):>8s} | {fmt(r90):>8s} | {signal or 'n/a'}"
+        info = results.get(ticker, {})
+        is_core_target = ticker in PORTFOLIO_TARGETS
+        near_ath_flag = info.get("is_near_ath")
+        price_delta = info.get("price_target_delta_pct")
+
+        action, factor, score = compute_dca_decision(
+            ticker,
+            r10,
+            r30,
+            r90,
+            is_core_target=is_core_target,
+            near_ath_flag=near_ath_flag,
+            price_target_delta_pct=price_delta,
         )
 
+        score_str = "n/a" if score is None else f"{score:.1f}%"
+        text_lines.append(
+            f"{ticker:6s} | {fmt(r10):>8s} | {fmt(r30):>8s} | {fmt(r90):>8s} | "
+            f"{score_str:>8s} | {action:18s} | x{factor:.2f}"
+        )
+
+        dca_info_for_table.append((ticker, score, action, factor))
+
+    # --------- HTML table: multi-horizon + momentum ---------
     html_rows = []
     for ticker, r10, r30, r90, signal, avg in rows_sorted:
+        info = results.get(ticker, {})
+        is_core_target = ticker in PORTFOLIO_TARGETS
+        near_ath_flag = info.get("is_near_ath")
+        price_delta = info.get("price_target_delta_pct")
+
+        action, factor, score = compute_dca_decision(
+            ticker,
+            r10,
+            r30,
+            r90,
+            is_core_target=is_core_target,
+            near_ath_flag=near_ath_flag,
+            price_target_delta_pct=price_delta,
+        )
+
         r10s, r30s, r90s = fmt(r10), fmt(r30), fmt(r90)
-
-        if signal == "PANIC_BUY":
-            signal_label = "PANIC"
-            color = "#c0392b"
-        elif signal == "EUPHORIA":
-            signal_label = "EUPHORIA"
-            color = "#e67e22"
-        elif signal == "NORMAL":
-            signal_label = "NORMAL"
-            color = "#2c3e50"
-        else:
-            signal_label = signal or "n/a"
-            color = "#7f8c8d"
-
-        signal_html = f"<span style='font-weight:bold; color:{color};'>{signal_label}</span>"
+        score_str = "n/a" if score is None else f"{score:.1f}%"
+        row_bg = bg_color_for_score(score)
 
         html_rows.append(
-            "<tr>"
+            f"<tr style='background-color:{row_bg};'>"
             f"<td style='padding:4px 8px; border:1px solid #ddd;'>{ticker}</td>"
             f"<td style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>{r10s}</td>"
             f"<td style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>{r30s}</td>"
             f"<td style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>{r90s}</td>"
-            f"<td style='padding:4px 8px; border:1px solid #ddd;'>{signal_html}</td>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>{score_str}</td>"
             "</tr>"
         )
 
@@ -429,7 +700,7 @@ def build_email_content(
         "<th style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>10d</th>"
         "<th style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>30d</th>"
         "<th style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>90d</th>"
-        "<th style='padding:4px 8px; border:1px solid #ddd; text-align:left;'>Signal</th>"
+        "<th style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>Momentum</th>"
         "</tr>"
         "</thead>"
         "<tbody>"
@@ -438,75 +709,142 @@ def build_email_content(
         "</table>"
     )
 
-    # Allocation for core AI leaders
-    core_alloc_items = [
-        (t, allocation.get(t, 0.0))
-        for t in CORE_AI_TICKERS
-        if allocation.get(t, 0.0) > 0
-    ]
-    total_core_alloc = sum(a for _, a in core_alloc_items)
-
-    text_lines.append("")
-    text_lines.append(
-        f"Recommended monthly allocation for AI leaders ({total_core_alloc:.0f} USD):"
-    )
-    for ticker, amount in core_alloc_items:
-        text_lines.append(f"{ticker:6s} {amount:.2f}")
-
-    html_alloc_rows = []
-    for ticker, amount in core_alloc_items:
-        html_alloc_rows.append(
+    # --------- DCA pacing recommendation table ---------
+    dca_rows_html: List[str] = []
+    for ticker, score, action, mult in dca_info_for_table:
+        score_str = "n/a" if score is None else f"{score:.1f}%"
+        dca_rows_html.append(
             "<tr>"
             f"<td style='padding:4px 8px; border:1px solid #ddd;'>{ticker}</td>"
-            f"<td style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>{amount:.2f}</td>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>{score_str}</td>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd;'>{action}</td>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>×{mult:.2f}</td>"
             "</tr>"
         )
 
-    html_alloc_table = (
-        "<table style='border-collapse:collapse; font-family:Arial, sans-serif; font-size:13px; margin-top:8px;'>"
+    dca_table = (
+        "<h3 style='margin-top:16px;'>DCA pacing recommendation</h3>"
+        "<table style='border-collapse:collapse; font-family:Arial, sans-serif; font-size:13px;'>"
         "<thead>"
         "<tr>"
         "<th style='padding:4px 8px; border:1px solid #ddd; text-align:left;'>Ticker</th>"
-        "<th style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>Monthly amount (USD)</th>"
+        "<th style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>Momentum</th>"
+        "<th style='padding:4px 8px; border:1px solid #ddd; text-align:left;'>Action</th>"
+        "<th style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>DCA factor</th>"
         "</tr>"
         "</thead>"
         "<tbody>"
-        + "".join(html_alloc_rows) +
+        + "".join(dca_rows_html) +
         "</tbody>"
         "</table>"
     )
 
-    # IBKR adjustments
-    text_lines.append("")
-    text_lines.append("IBKR adjustments for this month:")
+    # --------- Explanation of DCA logic ---------
+    dca_explanation = """
+<h4 style="margin-top:12px;">How to read these DCA recommendations</h4>
+<ul style="margin-top:4px;">
+  <li><strong>Momentum</strong> is a weighted score: 50% × 10d + 30% × 30d + 20% × 90d performance.</li>
+  <li><strong>ACCELERATE / ACCELERATE STRONGLY</strong> means the trend is constructive (uptrend or healthy dip) and momentum is positive.</li>
+  <li><strong>MAINTAIN</strong> means the signal is mixed or neutral: you continue your normal DCA without change.</li>
+  <li><strong>SLOW DOWN</strong> is used only when the structure (10d/30d/90d) looks like a real downtrend, and mostly on non-core positions.</li>
+  <li>If the price is near a <strong>multi-year high (ATH)</strong>, the model never recommends "ACCELERATE STRONGLY" to avoid chasing extreme breakouts.</li>
+  <li>If the market price is far <strong>above</strong> the average analyst target (&gt; +15%), the DCA is nudged one step more cautious. If it is far <strong>below</strong> (&lt; -15%) in a non-bearish trend, the DCA can be nudged more aggressive.</li>
+  <li><strong>Core portfolio names</strong> (those in your long-term target allocation) have a floor: the model does not slow them down too aggressively, to avoid missing the next "NVDA-like" cycle.</li>
+  <li>The <strong>DCA factor</strong> is a simple multiplicative adjustment to your usual monthly contribution (e.g. ×1.15 = +15% this month).</li>
+</ul>
+"""
 
-    ibkr_lines: List[str] = []
-    ibkr_html_rows: List[str] = []
+    # --------- Price vs analyst target table ---------
+    price_rows_html: List[str] = []
+    for ticker, info in results.items():
+        price = info.get("price")
+        target = info.get("target")
+        delta = info.get("price_target_delta_pct")
 
-    for ticker, amount in core_alloc_items:
-        old = IBKR_REFERENCE_MONTHLY.get(ticker)
-        if old is None:
+        if price is None and target is None:
             continue
-        # show non-trivial changes
-        if abs(old - amount) < 1.0:
-            continue
-        ibkr_lines.append(
-            f"{ticker}:\n"
-            f"Change monthly investment from {old:.0f} to {amount:.0f}\n"
-        )
-        ibkr_html_rows.append(
-            "<p style='margin:4px 0;'>"
-            f"<strong>{ticker}:</strong><br>"
-            f"Change monthly investment from {old:.0f} to {amount:.0f}"
-            "</p>"
+
+        if price is None:
+            price_str = "n/a"
+        else:
+            price_str = f"{price:,.2f}"
+
+        if target is None:
+            target_str = "n/a"
+        else:
+            target_str = f"{target:,.2f}"
+
+        if delta is None:
+            delta_str = "n/a"
+            row_bg = "#ffffff"
+            status = "n/a"
+        else:
+            delta_str = f"{delta:+.1f}%"
+            if delta > 15.0:
+                row_bg = "#fdecea"
+                status = "Above target (rich)"
+            elif delta < -15.0:
+                row_bg = "#e8f8f5"
+                status = "Below target (cheap)"
+            else:
+                row_bg = "#f8f9fa"
+                status = "Near target"
+
+        price_rows_html.append(
+            f"<tr style='background-color:{row_bg};'>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd;'>{ticker}</td>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>{price_str}</td>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>{target_str}</td>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>{delta_str}</td>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd;'>{status}</td>"
+            "</tr>"
         )
 
-    if not ibkr_lines:
-        text_lines.append("No changes required. Keep your current automatic investments.")
-        ibkr_html_block = "<p>No changes required. Keep your current automatic investments.</p>"
+    if price_rows_html:
+        price_target_table = (
+            "<h3 style='margin-top:16px;'>Market price vs analyst target</h3>"
+            "<table style='border-collapse:collapse; font-family:Arial, sans-serif; font-size:13px;'>"
+            "<thead>"
+            "<tr>"
+            "<th style='padding:4px 8px; border:1px solid #ddd; text-align:left;'>Ticker</th>"
+            "<th style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>Price</th>"
+            "<th style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>Analyst target</th>"
+            "<th style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>Delta</th>"
+            "<th style='padding:4px 8px; border:1px solid #ddd; text-align:left;'>Status</th>"
+            "</tr>"
+            "</thead>"
+            "<tbody>"
+            + "".join(price_rows_html) +
+            "</tbody>"
+            "</table>"
+        )
     else:
-        text_lines.extend(ibkr_lines)
-        ibkr_html_block = "".join(ibkr_html_rows)
+        price_target_table = ""
+
+    # --------- Target portfolio allocation table ---------
+    pt_rows_html: List[str] = []
+    for t, w in PORTFOLIO_TARGETS.items():
+        pt_rows_html.append(
+            "<tr>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd;'>{t}</td>"
+            f"<td style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>{w}%</td>"
+            "</tr>"
+        )
+
+    portfolio_table = (
+        "<h3 style='margin-top:16px;'>Target portfolio allocation</h3>"
+        "<table style='border-collapse:collapse; font-family:Arial, sans-serif; font-size:13px;'>"
+        "<thead>"
+        "<tr>"
+        "<th style='padding:4px 8px; border:1px solid #ddd; text-align:left;'>Ticker</th>"
+        "<th style='padding:4px 8px; border:1px solid #ddd; text-align:right;'>Target weight</th>"
+        "</tr>"
+        "</thead>"
+        "<tbody>"
+        + "".join(pt_rows_html) +
+        "</tbody>"
+        "</table>"
+    )
 
     text_body = "\n".join(text_lines)
 
@@ -516,10 +854,10 @@ def build_email_content(
     <p>{summary_html}</p>
     <h3 style="margin-top:16px;">Multi-horizon performance and signals</h3>
     {html_table}
-    <h3 style="margin-top:16px;">Recommended monthly allocation for AI leaders</h3>
-    {html_alloc_table}
-    <h3 style="margin-top:16px;">IBKR adjustments for this month</h3>
-    {ibkr_html_block}
+    {dca_table}
+    {dca_explanation}
+    {price_target_table}
+    {portfolio_table}
   </body>
 </html>
 """
@@ -636,8 +974,16 @@ def run_signals(budget: float, email_mode: str, dry_run: bool = False) -> int:
                 "source": "ERROR",
                 "secondary_returns": None,
                 "signal": "ERROR",
+                "price": None,
+                "target": None,
+                "price_target_delta_pct": None,
+                "is_near_ath": None,
             }
             continue
+
+        # Price / target / ATH (best effort)
+        price, target, delta_pct = get_price_and_target(ticker)
+        ath_flag = is_near_ath(ticker)
 
         if returns is None:
             print(f"{ticker:8s} | NO DATA")
@@ -646,6 +992,10 @@ def run_signals(budget: float, email_mode: str, dry_run: bool = False) -> int:
                 "source": source,
                 "secondary_returns": sec_returns,
                 "signal": "NO_DATA",
+                "price": price,
+                "target": target,
+                "price_target_delta_pct": delta_pct,
+                "is_near_ath": ath_flag,
             }
             continue
 
@@ -667,9 +1017,13 @@ def run_signals(budget: float, email_mode: str, dry_run: bool = False) -> int:
             "source": source,
             "secondary_returns": sec_returns,
             "signal": signal,
+            "price": price,
+            "target": target,
+            "price_target_delta_pct": delta_pct,
+            "is_near_ath": ath_flag,
         }
 
-    print("\n--- Allocation suggestion (core AI only) ---")
+    print("\n--- Allocation suggestion (core AI only, based on internal signals) ---")
     allocation, cash_remainder = compute_allocation(signals, budget)
 
     core_alloc_items = [
@@ -703,7 +1057,6 @@ def run_signals(budget: float, email_mode: str, dry_run: bool = False) -> int:
             send_email(subject, text_body, html_body)
     else:
         print("\n[INFO] No email sent (mode =", email_mode_env, ")")
-
 
     return 1 if had_error else 0
 
